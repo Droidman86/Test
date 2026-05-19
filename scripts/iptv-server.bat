@@ -7,7 +7,7 @@ REM    2. Put a shortcut to this file in the Startup folder to
 REM       launch on login:  shell:startup
 REM ============================================================
 
-set "FOLDER=D:\Movies"
+set "FOLDER=C:\iptv\movies"
 set "PORT=8080"
 
 REM Find python on PATH (try py launcher first, then python)
