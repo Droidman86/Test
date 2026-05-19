@@ -1,0 +1,39 @@
+[Unit]
+Description=Local IPTV server (M3U + web portal)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Edit these:
+#   User             - the Linux user that owns your movies folder
+#   WorkingDirectory - where iptv_server.py lives
+#   --folder         - your movies folder
+#   --port           - port to listen on
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/iptv
+ExecStart=/usr/bin/python3 /home/pi/iptv/iptv_server.py --folder /mnt/movies --port 8080
+
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
+
+# ---------------------------------------------------------------
+# Install:
+#   sudo cp scripts/iptv-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now iptv-server
+#
+# Check status / logs:
+#   systemctl status iptv-server
+#   journalctl -u iptv-server -f
+# ---------------------------------------------------------------

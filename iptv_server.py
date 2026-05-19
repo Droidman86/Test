@@ -51,12 +51,19 @@ AUTH_ENABLED = True
 AUTH_USER = "admin"
 AUTH_HASH = ""  # "salt_b64:hash_b64"
 AUTH_ITERS = 200_000
+SESSION_SECRET = b""
+SESSION_TTL = 7 * 86400  # 7 days
+COOKIE_NAME = "iptv_sess"
 
 import time
 STARTED_AT = time.time()
-SERVER_VERSION = "2.1"
+SERVER_VERSION = "3.0"
 LISTEN_HOST = ""
 LISTEN_PORT = 0
+
+# Background jobs (thumbnail generation, etc.)
+JOBS = {}  # job_id -> {"type","status","total","done","failed","current","started","finished","errors"}
+JOBS_LOCK = threading.Lock()
 
 
 # ---------- auth ----------
@@ -81,7 +88,7 @@ def verify_password(pwd):
 
 
 def load_auth():
-    global AUTH_USER, AUTH_HASH
+    global AUTH_USER, AUTH_HASH, SESSION_SECRET
     if not os.path.isfile(AUTH_FILE):
         return False
     try:
@@ -89,22 +96,115 @@ def load_auth():
             data = json.load(f)
         AUTH_USER = data.get("user") or "admin"
         AUTH_HASH = data.get("hash") or ""
+        sec = data.get("session_secret")
+        SESSION_SECRET = base64.b64decode(sec) if sec else secrets.token_bytes(32)
+        if not sec:
+            _persist_auth()
         return bool(AUTH_HASH)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, ValueError):
         return False
 
 
-def save_auth(user, pwd):
-    global AUTH_USER, AUTH_HASH
-    AUTH_USER = user
-    AUTH_HASH = hash_password(pwd)
+def _persist_auth():
     os.makedirs(META_DIR, exist_ok=True)
     with open(AUTH_FILE, "w", encoding="utf-8") as f:
-        json.dump({"user": AUTH_USER, "hash": AUTH_HASH}, f, indent=2)
+        json.dump({
+            "user": AUTH_USER,
+            "hash": AUTH_HASH,
+            "session_secret": base64.b64encode(SESSION_SECRET).decode(),
+        }, f, indent=2)
     try:
         os.chmod(AUTH_FILE, 0o600)
     except OSError:
         pass
+
+
+def save_auth(user, pwd):
+    global AUTH_USER, AUTH_HASH, SESSION_SECRET
+    AUTH_USER = user
+    AUTH_HASH = hash_password(pwd)
+    if not SESSION_SECRET:
+        SESSION_SECRET = secrets.token_bytes(32)
+    _persist_auth()
+
+
+def make_session_token(user):
+    exp = int(time.time()) + SESSION_TTL
+    payload = f"{user}|{exp}"
+    sig = hmac.new(SESSION_SECRET, payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}|{sig}".encode()).decode().rstrip("=")
+
+
+def verify_session_token(token):
+    if not token or not SESSION_SECRET:
+        return None
+    try:
+        pad = "=" * (-len(token) % 4)
+        decoded = base64.urlsafe_b64decode(token + pad).decode("utf-8")
+        user, exp, sig = decoded.rsplit("|", 2)
+        payload = f"{user}|{exp}"
+        expected = hmac.new(SESSION_SECRET, payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        if int(exp) < time.time():
+            return None
+        if user != AUTH_USER:
+            return None
+        return user
+    except (ValueError, base64.binascii.Error):
+        return None
+
+
+# ---------- jobs ----------
+
+def new_job(job_type):
+    jid = secrets.token_urlsafe(9)
+    with JOBS_LOCK:
+        JOBS[jid] = {
+            "id": jid, "type": job_type, "status": "running",
+            "total": 0, "done": 0, "failed": 0, "current": "",
+            "started": time.time(), "finished": None, "errors": [],
+        }
+    return jid
+
+
+def job_update(jid, **kw):
+    with JOBS_LOCK:
+        if jid in JOBS:
+            JOBS[jid].update(kw)
+
+
+def job_snapshot(jid):
+    with JOBS_LOCK:
+        return dict(JOBS.get(jid, {})) or None
+
+
+def generate_missing_thumbs_job(jid, mode="random"):
+    try:
+        videos = discover_videos()
+        missing = [r for r in videos if not _thumb_path(r, "custom") and not _thumb_path(r, "auto")]
+        job_update(jid, total=len(missing))
+        if not missing:
+            job_update(jid, status="done", finished=time.time())
+            return
+        for rel in missing:
+            snap = job_snapshot(jid)
+            if snap and snap.get("status") == "cancelled":
+                return
+            job_update(jid, current=rel)
+            ok = auto_generate_thumb(rel, mode=mode)
+            with JOBS_LOCK:
+                j = JOBS[jid]
+                if ok:
+                    j["done"] += 1
+                else:
+                    j["failed"] += 1
+                    j["errors"].append(rel)
+                    if len(j["errors"]) > 50:
+                        j["errors"] = j["errors"][-50:]
+        job_update(jid, status="done", finished=time.time(), current="")
+    except Exception as e:
+        job_update(jid, status="error", finished=time.time(), errors=[str(e)])
 
 
 # ---------- metadata ----------
@@ -379,9 +479,15 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("[%s] %s\n" % (self.address_string(), fmt % args))
 
     # auth ----------------------------------------------------
-    def _check_auth(self):
-        if not AUTH_ENABLED:
-            return True
+    def _cookie(self, name):
+        raw = self.headers.get("Cookie", "")
+        for part in raw.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == name:
+                return v
+        return None
+
+    def _check_basic(self):
         h = self.headers.get("Authorization", "")
         if not h.startswith("Basic "):
             return False
@@ -390,31 +496,72 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, base64.binascii.Error):
             return False
         user, _, pwd = decoded.partition(":")
-        user_ok = hmac.compare_digest(user, AUTH_USER)
-        pass_ok = verify_password(pwd)
-        return user_ok and pass_ok
+        return hmac.compare_digest(user, AUTH_USER) and verify_password(pwd)
 
-    def _require_auth(self):
+    def _check_cookie(self):
+        tok = self._cookie(COOKIE_NAME)
+        return bool(verify_session_token(tok)) if tok else False
+
+    def _check_auth(self):
+        if not AUTH_ENABLED:
+            return True
+        return self._check_cookie() or self._check_basic()
+
+    def _require_auth(self, mode="auto"):
+        """mode:
+        'auto'    - redirect HTML to /login, JSON-401 for everything else
+        'basic'   - always WWW-Authenticate (for M3U/streams so Smarters can auth)
+        """
         if self._check_auth():
             return True
-        body = b"Authentication required"
-        self.send_response(HTTPStatus.UNAUTHORIZED)
-        self.send_header("WWW-Authenticate", 'Basic realm="Local IPTV", charset="UTF-8"')
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        try:
-            self.wfile.write(body)
-        except BrokenPipeError:
-            pass
+        if mode == "basic":
+            body = b"Authentication required"
+            self.send_response(HTTPStatus.UNAUTHORIZED)
+            self.send_header("WWW-Authenticate", 'Basic realm="Local IPTV", charset="UTF-8"')
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try: self.wfile.write(body)
+            except BrokenPipeError: pass
+            return False
+
+        accept = (self.headers.get("Accept") or "").lower()
+        wants_html = "text/html" in accept
+        if wants_html and self.command == "GET":
+            nxt = urllib.parse.quote(self.path, safe="")
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", f"/login?next={nxt}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            body = json.dumps({"error": "Unauthenticated", "login": "/login"}).encode()
+            self.send_response(HTTPStatus.UNAUTHORIZED)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try: self.wfile.write(body)
+            except BrokenPipeError: pass
         return False
 
     # routing -------------------------------------------------
     def do_GET(self):
-        if not self._require_auth():
-            return
         p = urllib.parse.urlparse(self.path)
         path = p.path
+        # public / always-allowed routes
+        if path == "/login":
+            return self._html(LOGIN_HTML)
+        if path == "/logout":
+            return self._handle_logout()
+
+        # M3U + streams + thumbs use Basic so IPTV Smarters can auth
+        basic_paths = ("/playlist.m3u", "/playlist", "/playlist.m3u8")
+        if path in basic_paths or path.startswith("/stream/") or path.startswith("/thumb/"):
+            if not self._require_auth("basic"):
+                return
+        else:
+            if not self._require_auth("auto"):
+                return
+
         try:
             if path == "/" or path == "/index.html":
                 return self._html(PORTAL_HTML)
@@ -422,11 +569,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._html(ADMIN_HTML)
             if path == "/api/status":
                 return self._json(system_status())
+            if path == "/api/me":
+                return self._json({"user": AUTH_USER, "auth_enabled": AUTH_ENABLED})
             if path == "/api/videos":
                 return self._api_list_videos(p)
             if path.startswith("/api/video/") and path.count("/") == 3:
                 return self._api_get_video(path.split("/")[-1])
-            if path in ("/playlist.m3u", "/playlist", "/playlist.m3u8"):
+            if path.startswith("/api/jobs/"):
+                return self._api_job_status(path.split("/")[-1])
+            if path in basic_paths:
                 return self._serve_playlist()
             if path.startswith("/stream/"):
                 rel = urllib.parse.unquote(path[len("/stream/"):])
@@ -439,7 +590,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def do_HEAD(self):
-        if not self._require_auth():
+        if not self._require_auth("basic"):
             return
         p = urllib.parse.urlparse(self.path)
         if p.path.startswith("/stream/"):
@@ -448,7 +599,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._err(HTTPStatus.NOT_FOUND, "Not Found")
 
     def do_PATCH(self):
-        if not self._require_auth():
+        if not self._require_auth("auto"):
             return
         p = urllib.parse.urlparse(self.path)
         path = p.path
@@ -457,10 +608,15 @@ class Handler(BaseHTTPRequestHandler):
         return self._err(HTTPStatus.NOT_FOUND, "Not Found")
 
     def do_POST(self):
-        if not self._require_auth():
-            return
         p = urllib.parse.urlparse(self.path)
         path = p.path
+        if path == "/api/login":
+            return self._api_login()
+        if path == "/api/logout":
+            return self._handle_logout()
+
+        if not self._require_auth("auto"):
+            return
         m = re.match(r"^/api/video/([^/]+)/thumbnail$", path)
         if m:
             return self._api_upload_thumb(m.group(1))
@@ -471,10 +627,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._api_change_password()
         if path == "/api/ffmpeg-test":
             return self._api_ffmpeg_test()
+        if path == "/api/jobs/generate-missing-thumbs":
+            return self._api_start_generate_thumbs()
+        m = re.match(r"^/api/jobs/([^/]+)/cancel$", path)
+        if m:
+            return self._api_cancel_job(m.group(1))
         return self._err(HTTPStatus.NOT_FOUND, "Not Found")
 
     def do_DELETE(self):
-        if not self._require_auth():
+        if not self._require_auth("auto"):
             return
         p = urllib.parse.urlparse(self.path)
         m = re.match(r"^/api/video/([^/]+)/thumbnail$", p.path)
@@ -638,6 +799,71 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, subprocess.TimeoutExpired) as e:
             self._json({"ok": False, "error": str(e)})
 
+    # auth/session ---
+    def _api_login(self):
+        body = self._read_body(max_bytes=4096)
+        try:
+            data = json.loads(body or b"{}")
+        except json.JSONDecodeError:
+            return self._err(HTTPStatus.BAD_REQUEST, "Invalid JSON")
+        user = data.get("user") or ""
+        pwd = data.get("password") or ""
+        if not AUTH_ENABLED:
+            return self._json({"ok": True, "user": user})
+        if not hmac.compare_digest(user, AUTH_USER) or not verify_password(pwd):
+            return self._err(HTTPStatus.UNAUTHORIZED, "Invalid credentials")
+        token = make_session_token(user)
+        body = json.dumps({"ok": True, "user": user}).encode()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Set-Cookie",
+            f"{COOKIE_NAME}={token}; Path=/; Max-Age={SESSION_TTL}; HttpOnly; SameSite=Lax")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_logout(self):
+        body = json.dumps({"ok": True}).encode() if self.command == "POST" else b""
+        if self.command == "GET":
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/login")
+        else:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Set-Cookie",
+            f"{COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    # jobs ---
+    def _api_start_generate_thumbs(self):
+        if not HAS_FFMPEG:
+            return self._err(HTTPStatus.BAD_REQUEST, "ffmpeg not installed (needed for bulk generation)")
+        with JOBS_LOCK:
+            for j in JOBS.values():
+                if j["type"] == "thumbs" and j["status"] == "running":
+                    return self._json(j)
+        jid = new_job("thumbs")
+        t = threading.Thread(target=generate_missing_thumbs_job,
+                             args=(jid,), kwargs={"mode": "random"}, daemon=True)
+        t.start()
+        self._json(job_snapshot(jid))
+
+    def _api_job_status(self, jid):
+        snap = job_snapshot(jid)
+        if not snap:
+            return self._err(HTTPStatus.NOT_FOUND, "Unknown job")
+        self._json(snap)
+
+    def _api_cancel_job(self, jid):
+        snap = job_snapshot(jid)
+        if not snap:
+            return self._err(HTTPStatus.NOT_FOUND, "Unknown job")
+        job_update(jid, status="cancelled")
+        self._json(job_snapshot(jid))
+
     def _api_delete_thumb(self, vid):
         rel = self._rel_for_id(vid)
         if not rel:
@@ -770,6 +996,62 @@ COMMON_CSS = r"""
   .toast.ok { border-color: var(--ok); color: var(--ok); }
 """
 
+LOGIN_HTML = (r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>Local IPTV — Sign in</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>__CSS__
+  .wrap { min-height: 100vh; display: grid; place-items: center; padding: 20px; }
+  .box { background: var(--panel); border:1px solid var(--border); border-radius: 12px;
+         padding: 28px; width: min(380px, 100%); }
+  .box h1 { margin: 0 0 6px; font-size: 22px; }
+  .box p.sub { margin: 0 0 22px; color: var(--muted); font-size: 13px; }
+  .box label { display: block; font-size: 13px; color: var(--muted); margin-top: 12px; }
+  .box input { width: 100%; margin-top: 4px; background: var(--bg); color: var(--text);
+               border:1px solid var(--border); border-radius: 6px; padding: 10px 12px;
+               font-size: 14px; }
+  .box input:focus { outline: none; border-color: var(--accent); }
+  .box button { width: 100%; margin-top: 18px; padding: 11px; font-size: 14px;
+                font-weight: 600; }
+  .err { color: var(--danger); font-size: 13px; margin-top: 12px; min-height: 18px; }
+</style></head>
+<body>
+<div class="wrap"><form class="box" id="loginForm">
+  <h1>📺 Local IPTV</h1>
+  <p class="sub">Sign in to continue.</p>
+  <label>Username<input id="u" autocomplete="username" autofocus></label>
+  <label>Password<input id="p" type="password" autocomplete="current-password"></label>
+  <button type="submit" class="primary">Sign in</button>
+  <div class="err" id="err"></div>
+</form></div>
+<script>
+const $ = id => document.getElementById(id);
+const q = new URLSearchParams(location.search);
+$('loginForm').onsubmit = async e => {
+  e.preventDefault();
+  $('err').textContent = '';
+  try {
+    const r = await fetch('/api/login', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({user: $('u').value, password: $('p').value})
+    });
+    if (!r.ok) {
+      let m = 'Sign-in failed';
+      try { m = (await r.json()).error || m; } catch(e) {}
+      $('err').textContent = m;
+      return;
+    }
+    let next = q.get('next') || '/';
+    try { next = decodeURIComponent(next); } catch(e) {}
+    if (!next.startsWith('/')) next = '/';
+    location.href = next;
+  } catch(e) { $('err').textContent = e.message; }
+};
+</script>
+</body></html>
+""").replace("__CSS__", COMMON_CSS)
+
+
 PORTAL_HTML = (r"""<!doctype html>
 <html lang="en">
 <head>
@@ -852,14 +1134,22 @@ PORTAL_HTML = (r"""<!doctype html>
   <label><input type="checkbox" id="favOnly"> favorites only</label>
   <span style="flex:1"></span>
   <a class="nav" href="/admin">⚙ Admin</a>
+  <a class="nav" href="/logout">↪ Logout</a>
   <span id="status" style="color: var(--muted); font-size: 13px;"></span>
 </header>
 <main>
   <div id="grid" class="grid"></div>
   <div id="empty" class="empty" style="display:none">No videos match.</div>
   <p style="color:var(--muted);font-size:12px;margin-top:24px">
-    Tip: drag an image file onto any card to set its thumbnail. Click a card to edit.
+    Tips: click a card to edit. Drop a single image onto a card to set its thumbnail.
+    <b>Drop multiple images anywhere on the page to bulk-assign by filename match</b>
+    (e.g. <code>Heat.jpg</code> → matches video named <code>Heat.mp4</code>).
   </p>
+  <div id="bulkOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:40;pointer-events:none">
+    <div style="background:var(--panel);border:2px dashed var(--ok);padding:40px 60px;border-radius:16px;font-size:18px">
+      🎯 Drop images to bulk-assign by filename
+    </div>
+  </div>
 </main>
 
 <div class="modal-bg" id="modal">
@@ -1230,6 +1520,66 @@ $('btnDelThumb').onclick = async () => {
 ['search','groupFilter','showHidden','favOnly'].forEach(id =>
   $(id).addEventListener('input', render));
 
+// --- bulk drop on document: filename-stem match images to videos ---
+function stem(name) {
+  const dot = name.lastIndexOf('.');
+  return (dot > 0 ? name.slice(0, dot) : name).toLowerCase()
+    .replace(/[\s._\-]+/g, ' ').trim();
+}
+let dragDepth = 0;
+function isFileDrag(e) {
+  if (!e.dataTransfer) return false;
+  return Array.from(e.dataTransfer.types || []).includes('Files');
+}
+document.addEventListener('dragenter', e => {
+  if (!isFileDrag(e)) return;
+  e.preventDefault();
+  dragDepth++;
+  $('bulkOverlay').style.display = 'flex';
+});
+document.addEventListener('dragover', e => {
+  if (isFileDrag(e)) e.preventDefault();
+});
+document.addEventListener('dragleave', e => {
+  if (!isFileDrag(e)) return;
+  dragDepth--;
+  if (dragDepth <= 0) { dragDepth = 0; $('bulkOverlay').style.display = 'none'; }
+});
+document.addEventListener('drop', async e => {
+  if (!isFileDrag(e)) return;
+  e.preventDefault();
+  dragDepth = 0;
+  $('bulkOverlay').style.display = 'none';
+  const files = Array.from(e.dataTransfer.files || []).filter(f => f.type.startsWith('image/'));
+  if (!files.length) return;
+  // single file dropped on a card is already handled by the card's drop handler
+  if (files.length === 1) {
+    const onCard = e.target.closest && e.target.closest('.card');
+    if (onCard) return;
+  }
+  // build stem index of visible videos
+  const idx = new Map();
+  STATE.videos.forEach(v => {
+    const k = stem(v.path.split('/').pop());
+    if (!idx.has(k)) idx.set(k, []);
+    idx.get(k).push(v);
+  });
+  let matched = 0, ambiguous = 0, unmatched = 0, failed = 0;
+  for (const f of files) {
+    const k = stem(f.name);
+    const cands = idx.get(k);
+    if (!cands) { unmatched++; continue; }
+    if (cands.length > 1) { ambiguous++; continue; }
+    try { await uploadThumbFor(cands[0].id, f); matched++; }
+    catch(err) { failed++; }
+  }
+  const parts = [`Matched ${matched}`];
+  if (ambiguous) parts.push(`${ambiguous} ambiguous`);
+  if (unmatched) parts.push(`${unmatched} unmatched`);
+  if (failed) parts.push(`${failed} failed`);
+  toast(parts.join(' · '), matched ? 'ok' : 'err');
+});
+
 load().catch(e => toast(e.message, 'err'));
 </script>
 </body></html>
@@ -1404,6 +1754,20 @@ async function loadStatus() {
         <div class="stat"><div class="n">${s.library.custom_thumbnails}</div><div class="l">Custom thumbs</div></div>
         <div class="stat"><div class="n">${s.library.auto_thumbnails}</div><div class="l">Auto thumbs</div></div>
       </div>
+      <div class="actions">
+        <button id="btnGenAll" ${ff.installed?'':'disabled'} title="${ff.installed?'Run ffmpeg to generate random-frame thumbnails for every video missing one':'Requires ffmpeg'}">
+          🎨 Generate missing thumbnails
+        </button>
+      </div>
+      <div id="jobBox" style="display:none;margin-top:12px">
+        <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:6px">
+          <span id="jobLabel"></span><span id="jobCount"></span>
+        </div>
+        <div style="height:8px;background:var(--bg);border-radius:4px;overflow:hidden;border:1px solid var(--border)">
+          <div id="jobBar" style="height:100%;width:0%;background:var(--accent2);transition:width .2s"></div>
+        </div>
+        <div id="jobCurrent" style="font-size:11px;color:var(--muted);margin-top:6px;font-family:ui-monospace,monospace;word-break:break-all"></div>
+      </div>
     </div>
 
     <div class="card">
@@ -1435,6 +1799,49 @@ async function loadStatus() {
   };
   const pw = $('btnPwd');
   if (pw) pw.onclick = () => $('pwdDlg').showModal();
+  const gn = $('btnGenAll');
+  if (gn) gn.onclick = startGenerateMissing;
+}
+
+let JOB_ID = null;
+async function startGenerateMissing() {
+  $('btnGenAll').disabled = true;
+  try {
+    const j = await api('/api/jobs/generate-missing-thumbs', {method:'POST'});
+    JOB_ID = j.id;
+    showJob(j);
+    pollJob();
+  } catch(e) { toast(e.message, 'err'); $('btnGenAll').disabled = false; }
+}
+function showJob(j) {
+  $('jobBox').style.display = '';
+  const pct = j.total ? Math.round(((j.done + j.failed) / j.total) * 100) : 0;
+  $('jobBar').style.width = pct + '%';
+  $('jobLabel').textContent =
+    j.status === 'running' ? `Generating thumbnails… (${pct}%)`
+    : j.status === 'done' ? `Done — ${j.done} created, ${j.failed} failed`
+    : j.status === 'cancelled' ? 'Cancelled'
+    : `Status: ${j.status}`;
+  $('jobCount').textContent = `${j.done + j.failed} / ${j.total}`;
+  $('jobCurrent').textContent = j.current ? '➜ ' + j.current : '';
+}
+async function pollJob() {
+  if (!JOB_ID) return;
+  try {
+    const j = await api('/api/jobs/' + JOB_ID);
+    showJob(j);
+    if (j.status === 'running') {
+      setTimeout(pollJob, 1000);
+    } else {
+      $('btnGenAll').disabled = false;
+      if (j.status === 'done') toast(`Generated ${j.done} thumbnail(s)`, 'ok');
+      JOB_ID = null;
+      loadStatus();
+    }
+  } catch(e) {
+    $('btnGenAll').disabled = false;
+    toast(e.message, 'err');
+  }
 }
 
 $('btnRefresh').onclick = loadStatus;
